@@ -2,8 +2,7 @@ import re
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
+
 
 # =========================================================
 # 1. 기본 설정: 보성지사 관리 구간과 IC 위치
