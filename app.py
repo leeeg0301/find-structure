@@ -1,14 +1,18 @@
-import re
 from pathlib import Path
+import csv
+import html
+import re
 
-import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
 
 
 # =========================================================
-# 1. 기본 설정: 보성지사 관리 구간과 IC 위치
+# 1. 기본 설정값
 # =========================================================
-ROUTE_MIN_KM = 0.0
-ROUTE_MAX_KM = 106.84
+
+ROAD_START_KM = 0.0
+ROAD_END_KM = 106.84
 
 IC_POINTS = {
     "서영암IC": 0.0,
@@ -20,443 +24,876 @@ IC_POINTS = {
     "해룡IC": 106.84,
 }
 
+BRANCH_NAME = "보성지사"
+
 BRIDGE_FILE = "bridgedata.csv"
 TUNNEL_FILE = "tunneldata.csv"
 
-# 교량 연장은 대부분 수십~수백 m라서 실제 축척대로 그리면 거의 안 보임.
-# 그래서 실제 연장을 계산하되, 화면 표시용 최소 폭을 둔다.
-MIN_VISUAL_WIDTH_KM = 0.9
+MIN_VISUAL_WIDTH_KM_BRIDGE = 0.65
+MIN_VISUAL_WIDTH_KM_TUNNEL = 0.9
+
+SVG_W = 1180
+SVG_H = 455
+LEFT = 82
+RIGHT = 60
+ROAD_W = SVG_W - LEFT - RIGHT
 
 
 # =========================================================
-# 2. 한글 초성 검색 함수
+# 2. 초성 검색 함수
 # =========================================================
+
 CHOSUNG_LIST = [
     "ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ", "ㅅ",
     "ㅆ", "ㅇ", "ㅈ", "ㅉ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"
 ]
-CHOSUNG_SET = set(CHOSUNG_LIST)
 
 
-def get_chosung(text: str) -> str:
-    """문자열을 초성 문자열로 변환한다. 예: 서영암IC교 -> ㅅㅇㅇicㄱ"""
+def normalize_text(value):
+    """
+    검색 비교를 쉽게 하기 위해
+    1) None을 빈 문자열로 바꾸고
+    2) 공백을 제거하고
+    3) 영문은 소문자로 바꾼다.
+    """
+    if value is None:
+        return ""
+
+    text = str(value)
+    text = re.sub(r"\s+", "", text)
+    text = text.lower()
+    return text
+
+
+def make_chosung(value):
+    """
+    한글 문자열을 초성 문자열로 바꾼다.
+
+    예)
+    서영암IC교 -> ㅅㅇㅇicㄱ
+    신덕1교 -> ㅅㄷ1ㄱ
+    """
+    text = normalize_text(value)
     result = []
-    for char in str(text):
+
+    for char in text:
         code = ord(char)
-        if 0xAC00 <= code <= 0xD7A3:  # 완성형 한글 범위
-            idx = (code - 0xAC00) // 588
-            result.append(CHOSUNG_LIST[idx])
+
+        if 0xAC00 <= code <= 0xD7A3:
+            chosung_index = (code - 0xAC00) // 588
+            result.append(CHOSUNG_LIST[chosung_index])
         else:
-            result.append(char.lower())
+            result.append(char)
+
     return "".join(result)
 
 
-def normalize_text(text: str) -> str:
-    """검색 비교용으로 공백과 대소문자를 정리한다."""
-    return re.sub(r"\s+", "", str(text).lower())
-
-
-def is_chosung_query(text: str) -> bool:
-    """입력값이 ㄱㄴㄷ 같은 초성만으로 구성되어 있는지 확인한다."""
-    cleaned = normalize_text(text)
-    return bool(cleaned) and all(ch in CHOSUNG_SET for ch in cleaned)
-
-
 # =========================================================
-# 3. 데이터 로드 및 전처리
+# 3. CSV 읽기
 # =========================================================
-@st.cache_data
-def read_csv_safely(file_path: str) -> pd.DataFrame:
-    """CSV 인코딩이 utf-8인지 cp949인지 몰라도 읽을 수 있게 여러 인코딩을 시도한다."""
+
+def read_csv_auto(path):
+    """
+    CSV 파일을 읽는다.
+    도로공사 자료는 cp949인 경우가 많아서 여러 인코딩을 순서대로 시도한다.
+    """
     encodings = ["utf-8-sig", "cp949", "euc-kr", "utf-8"]
     last_error = None
 
     for enc in encodings:
         try:
-            return pd.read_csv(file_path, encoding=enc)
+            with open(path, "r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                return rows, enc
         except Exception as e:
             last_error = e
 
-    raise RuntimeError(f"CSV 파일을 읽지 못했습니다: {file_path}\n마지막 오류: {last_error}")
+    raise RuntimeError(f"CSV 파일을 읽을 수 없습니다: {path}\n{last_error}")
 
 
-def detect_direction(name: str) -> str:
-    """시설물명에 붙은 (순천), (영암)을 이용해 방향을 판정한다."""
-    name = str(name)
-    if "(순천)" in name or "（순천）" in name:
+def clean_value(value):
+    """
+    CSV에서 읽은 값을 화면에 보여주기 좋은 문자열로 정리한다.
+    """
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+
+    if text.lower() in ["nan", "none"]:
+        return ""
+
+    return text
+
+
+def to_float(value, default=None):
+    """
+    이정, 연장 같은 값을 숫자로 바꾼다.
+
+    예)
+    106.84 -> 106.84
+    1,234 -> 1234
+    106.8k -> 106.8
+    30m -> 30
+    """
+    if value is None:
+        return default
+
+    text = str(value).strip().replace(",", "")
+
+    if text == "":
+        return default
+
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+
+    if not match:
+        return default
+
+    try:
+        return float(match.group())
+    except ValueError:
+        return default
+
+
+# =========================================================
+# 4. 시설명, 방향, 데이터 구조 정리
+# =========================================================
+
+def get_direction(name):
+    """
+    시설명 괄호 안에 있는 방향 정보를 읽는다.
+
+    예)
+    서영암IC교(순천) -> 순천방향
+    서영암IC교(영암) -> 영암방향
+    방향 표시 없음 -> 양방향/공용
+    """
+    text = str(name)
+
+    paren_values = re.findall(r"\((.*?)\)", text)
+    paren_text = " ".join(paren_values)
+
+    if "순천" in paren_text:
         return "순천방향"
-    if "(영암)" in name or "（영암）" in name:
+
+    if "영암" in paren_text:
         return "영암방향"
+
     return "양방향/공용"
 
 
-def base_facility_name(name: str) -> str:
-    """서영암IC교(순천) -> 서영암IC교 처럼 방향 표기를 제거한다."""
-    name = str(name)
-    name = re.sub(r"[\(（]\s*(순천|영암)\s*[\)）]", "", name)
-    return name.strip()
+def base_name(name):
+    """
+    같은 시설의 순천/영암 방향을 묶기 위해 괄호 방향 표기를 제거한다.
+
+    예)
+    서영암IC교(순천) -> 서영암IC교
+    서영암IC교(영암) -> 서영암IC교
+    """
+    text = str(name)
+    text = re.sub(r"\((순천|영암)\)", "", text)
+    return text.strip()
 
 
-def preprocess_facility_data(df: pd.DataFrame, name_col: str, type_col: str, facility_kind: str) -> pd.DataFrame:
-    """보성지사 자료만 남기고 지도 표시와 검색에 필요한 보조 컬럼을 만든다."""
-    required_cols = ["지사", name_col, "이정", "연장"]
-    missing = [col for col in required_cols if col not in df.columns]
-    if missing:
-        raise ValueError(f"{facility_kind} 데이터에 필요한 컬럼이 없습니다: {missing}")
-
-    out = df.copy()
-
-    # 보성지사 + 관리구간만 사용
-    out = out[out["지사"].astype(str).str.strip().eq("보성지사")].copy()
-
-    # 숫자형 변환: 이정은 km, 연장은 m 단위로 사용
-    out["이정_km"] = pd.to_numeric(out["이정"], errors="coerce")
-    out["연장_m"] = pd.to_numeric(out["연장"], errors="coerce")
-    out = out.dropna(subset=[name_col, "이정_km"])
-
-    # 106.84k 바로 근처 시설물은 107로 입력된 경우가 있어 약간 여유를 둔다.
-    out = out[(out["이정_km"] >= ROUTE_MIN_KM - 0.5) & (out["이정_km"] <= ROUTE_MAX_KM + 0.5)].copy()
-
-    out["시설구분"] = facility_kind
-    out["시설명"] = out[name_col].astype(str).str.strip()
-    out["기본시설명"] = out["시설명"].apply(base_facility_name)
-    out["방향"] = out["시설명"].apply(detect_direction)
-
-    if type_col in out.columns:
-        out["종별표시"] = out[type_col].astype(str).replace("nan", "-")
+def build_item(row, item_type):
+    """
+    CSV 한 행을 앱에서 사용하기 좋은 공통 구조로 변환한다.
+    교량과 터널의 컬럼명이 조금 다르므로 여기에서 맞춰준다.
+    """
+    if item_type == "bridge":
+        name_col = "교량명"
+        type_col = "종별구분"
+        category_name = "교량"
     else:
-        out["종별표시"] = "-"
+        name_col = "터널명"
+        type_col = "종별"
+        category_name = "터널"
 
-    # 검색용 보조 컬럼
-    out["_norm_name"] = out["시설명"].apply(normalize_text)
-    out["_norm_base"] = out["기본시설명"].apply(normalize_text)
-    out["_chosung_name"] = out["시설명"].apply(lambda x: normalize_text(get_chosung(x)))
-    out["_chosung_base"] = out["기본시설명"].apply(lambda x: normalize_text(get_chosung(x)))
+    name = clean_value(row.get(name_col))
+    km = to_float(row.get("이정"))
+    length_m = to_float(row.get("연장"), 0.0)
 
-    out = out.sort_values(["이정_km", "시설명"]).reset_index(drop=True)
-    return out
+    if not name:
+        return None
+
+    if km is None:
+        return None
+
+    if km < ROAD_START_KM - 1 or km > ROAD_END_KM + 1:
+        return None
+
+    item = {
+        "구분": category_name,
+        "시설명": name,
+        "기본명": base_name(name),
+        "방향": get_direction(name),
+        "이정": km,
+        "연장_m": length_m or 0.0,
+        "종별": clean_value(row.get(type_col)),
+        "노선": clean_value(row.get("노선")),
+        "지사": clean_value(row.get("지사")),
+        "초성": make_chosung(name),
+        "검색명": normalize_text(name),
+        "검색기본명": normalize_text(base_name(name)),
+    }
+
+    return item
 
 
-@st.cache_data
-def load_all_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    bridge_raw = read_csv_safely(BRIDGE_FILE)
-    tunnel_raw = read_csv_safely(TUNNEL_FILE)
-
-    bridge_df = preprocess_facility_data(
-        bridge_raw,
-        name_col="교량명",
-        type_col="종별구분",
-        facility_kind="교량",
-    )
-    tunnel_df = preprocess_facility_data(
-        tunnel_raw,
-        name_col="터널명",
-        type_col="종별",
-        facility_kind="터널",
-    )
-    return bridge_df, tunnel_df
-
-
-# =========================================================
-# 4. 검색 로직
-# =========================================================
-def search_facilities(df: pd.DataFrame, query: str, limit: int = 60) -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def load_data():
     """
+    교량과 터널 CSV를 읽고 보성지사 데이터만 추출한다.
+    """
+    base_dir = Path(__file__).resolve().parent
+
+    bridge_path = base_dir / BRIDGE_FILE
+    tunnel_path = base_dir / TUNNEL_FILE
+
+    missing_files = []
+
+    if not bridge_path.exists():
+        missing_files.append(BRIDGE_FILE)
+
+    if not tunnel_path.exists():
+        missing_files.append(TUNNEL_FILE)
+
+    if missing_files:
+        missing_text = ", ".join(missing_files)
+        raise FileNotFoundError(
+            f"다음 CSV 파일이 app.py와 같은 폴더에 있어야 합니다: {missing_text}"
+        )
+
+    bridge_rows, bridge_encoding = read_csv_auto(bridge_path)
+    tunnel_rows, tunnel_encoding = read_csv_auto(tunnel_path)
+
+    bridge_items = []
+    tunnel_items = []
+
+    for row in bridge_rows:
+        branch = clean_value(row.get("지사"))
+
+        if BRANCH_NAME in branch:
+            item = build_item(row, "bridge")
+
+            if item:
+                bridge_items.append(item)
+
+    for row in tunnel_rows:
+        branch = clean_value(row.get("지사"))
+
+        if BRANCH_NAME in branch:
+            item = build_item(row, "tunnel")
+
+            if item:
+                tunnel_items.append(item)
+
+    bridge_items.sort(key=lambda x: (x["이정"], x["시설명"]))
+    tunnel_items.sort(key=lambda x: (x["이정"], x["시설명"]))
+
+    meta = {
+        "bridge_encoding": bridge_encoding,
+        "tunnel_encoding": tunnel_encoding,
+        "bridge_count": len(bridge_items),
+        "tunnel_count": len(tunnel_items),
+    }
+
+    return bridge_items, tunnel_items, meta
+
+
+# =========================================================
+# 5. 검색 로직
+# =========================================================
+
+def search_items(items, keyword, limit=80):
+    """
+    시설명 직접 검색과 초성 검색을 동시에 수행한다.
+
     검색 우선순위
-    1) 시설명/기본시설명에 직접 포함되는 경우
-    2) 초성 입력이 시설명 초성과 일치하는 경우
-    3) 두 글자 이상 입력했을 때 초성 변환값이 일치하는 경우
+    1. 시설명이 검색어로 시작
+    2. 괄호 제거한 시설명이 검색어로 시작
+    3. 시설명 안에 검색어 포함
+    4. 괄호 제거한 시설명 안에 검색어 포함
+    5. 초성이 검색어로 시작
+    6. 초성 안에 검색어 포함
     """
-    q = normalize_text(query)
-    if not q:
-        return df.head(limit).copy()
+    keyword = normalize_text(keyword)
+    keyword_chosung = make_chosung(keyword)
 
-    q_chosung = normalize_text(get_chosung(query))
-    only_chosung = is_chosung_query(query)
+    if not keyword:
+        return items[:limit]
 
-    rows = []
-    for idx, row in df.iterrows():
+    results = []
+
+    for item in items:
+        name = item["검색명"]
+        base = item["검색기본명"]
+        chosung = item["초성"]
+
         score = None
 
-        # 일반 검색: 서, 서영암, ic 등
-        if row["_norm_name"].startswith(q) or row["_norm_base"].startswith(q):
+        if name.startswith(keyword):
             score = 0
-        elif q in row["_norm_name"] or q in row["_norm_base"]:
+        elif base.startswith(keyword):
             score = 1
-
-        # 초성 검색: ㅅ, ㅅㄷ, ㅅㅇㅇ 등
-        elif only_chosung and (q in row["_chosung_name"] or q in row["_chosung_base"]):
+        elif keyword in name:
             score = 2
-
-        # '서영'처럼 한글 두 글자 이상을 입력했을 때도 초성 ㅅㅇ으로 보조 검색
-        elif len(q) >= 2 and q_chosung and (q_chosung in row["_chosung_name"] or q_chosung in row["_chosung_base"]):
+        elif keyword in base:
             score = 3
+        elif chosung.startswith(keyword_chosung):
+            score = 4
+        elif keyword_chosung in chosung:
+            score = 5
 
         if score is not None:
-            rows.append((score, idx))
+            results.append((score, item["이정"], item["시설명"], item))
 
-    if not rows:
-        return df.iloc[0:0].copy()
+    results.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    matched_idx = [idx for score, idx in sorted(rows, key=lambda x: (x[0], df.loc[x[1], "이정_km"], df.loc[x[1], "시설명"]))]
-    return df.loc[matched_idx].head(limit).copy()
+    return [r[3] for r in results[:limit]]
 
 
-def make_option_label(row: pd.Series) -> str:
-    length = row.get("연장_m")
-    length_txt = "-" if pd.isna(length) else f"{length:,.0f}m"
-    return f"{row['시설명']}  |  {row['이정_km']:.2f}k  |  {row['방향']}  |  {row['종별표시']}  |  {length_txt}"
-
-
-# =========================================================
-# 5. 이정 + 연장을 화면 좌표로 변환
-# =========================================================
-def calc_span(km: float, length_m: float | int | None) -> tuple[float, float, float, float]:
+def format_option(item):
     """
-    실제 표시 구간과 화면 표시 구간을 모두 계산한다.
-    - 실제 구간: 이정을 중심으로 연장/2만큼 좌우로 배치
-    - 화면 구간: 너무 짧으면 MIN_VISUAL_WIDTH_KM로 확대
+    selectbox에 표시할 문구를 만든다.
     """
-    km = float(km)
-    length_km = 0.0 if pd.isna(length_m) else max(float(length_m) / 1000.0, 0.0)
-
-    actual_start = max(ROUTE_MIN_KM, km - length_km / 2)
-    actual_end = min(ROUTE_MAX_KM, km + length_km / 2)
-
-    visual_width = max(actual_end - actual_start, MIN_VISUAL_WIDTH_KM)
-    visual_start = km - visual_width / 2
-    visual_end = km + visual_width / 2
-
-    # 관리구간 밖으로 삐져나가지 않게 보정
-    if visual_start < ROUTE_MIN_KM:
-        visual_end += ROUTE_MIN_KM - visual_start
-        visual_start = ROUTE_MIN_KM
-    if visual_end > ROUTE_MAX_KM:
-        visual_start -= visual_end - ROUTE_MAX_KM
-        visual_end = ROUTE_MAX_KM
-    visual_start = max(ROUTE_MIN_KM, visual_start)
-
-    return actual_start, actual_end, visual_start, visual_end
-
-
-def direction_bands(direction: str) -> list[tuple[float, float]]:
-    """방향별로 도식에서 칠할 y 구간을 반환한다."""
-    if direction == "영암방향":
-        return [(3.05, 5.95)]
-    if direction == "순천방향":
-        return [(0.05, 2.95)]
-    # 방향 표기가 없으면 양방향에 모두 표시
-    return [(3.05, 5.95), (0.05, 2.95)]
-
-
-# =========================================================
-# 6. 도식 그리기
-# =========================================================
-def draw_route_map(selected_df: pd.DataFrame, title: str) -> go.Figure:
-    fig = go.Figure()
-
-    # 세로 격자: 10km 단위 + 종점 106.84k
-    grid_x = list(range(0, 101, 10)) + [ROUTE_MAX_KM]
-    for x in grid_x:
-        fig.add_shape(
-            type="line", x0=x, x1=x, y0=0, y1=6,
-            line=dict(color="rgba(90,90,90,0.85)", width=1.3),
-        )
-
-    # 가로 격자: 6개 band + 중앙분리대
-    for y in range(0, 7):
-        fig.add_shape(
-            type="line", x0=ROUTE_MIN_KM, x1=ROUTE_MAX_KM, y0=y, y1=y,
-            line=dict(color="rgba(90,90,90,0.85)", width=1.3),
-        )
-
-    # 중앙분리대 굵은 선
-    fig.add_shape(
-        type="rect", x0=ROUTE_MIN_KM, x1=ROUTE_MAX_KM, y0=2.96, y1=3.04,
-        fillcolor="black", line=dict(color="black"),
-    )
-
-    # IC 이름과 km 표기
-    for ic_name, km in IC_POINTS.items():
-        fig.add_annotation(x=km, y=6.42, text=f"<b>{ic_name}</b>", showarrow=False,
-                           font=dict(color="#2458ff", size=15), yanchor="bottom")
-        fig.add_annotation(x=km, y=6.13, text=f"{km:g}k", showarrow=False,
-                           font=dict(color="rgb(70,70,70)", size=13), yanchor="bottom")
-
-    # 10km 숫자 보조 표기
-    for km in range(10, 101, 10):
-        if km not in IC_POINTS.values():
-            fig.add_annotation(x=km, y=6.05, text=f"{km}", showarrow=False,
-                               font=dict(color="rgb(70,70,70)", size=12), yanchor="bottom")
-
-    # 좌측 방향 라벨
-    fig.add_annotation(x=-3.5, y=4.5, text="영암<br>방향", showarrow=False,
-                       font=dict(size=14, color="rgb(40,40,40)"), xanchor="right")
-    fig.add_annotation(x=-3.5, y=1.5, text="순천<br>방향", showarrow=False,
-                       font=dict(size=14, color="rgb(40,40,40)"), xanchor="right")
-
-    # 우측 차로 라벨
-    right_labels = [(5.5, "갓길"), (4.5, "2차로"), (3.5, "1차로"),
-                    (2.5, "1차로"), (1.5, "2차로"), (0.5, "갓길")]
-    for y, label in right_labels:
-        fig.add_annotation(x=ROUTE_MAX_KM + 1.0, y=y, text=label, showarrow=False,
-                           font=dict(size=12, color="rgb(80,80,80)"), xanchor="left")
-
-    # 방향 화살표 안내
-    fig.add_annotation(x=53, y=6.72, text="영암방향: 106.8k → 0k &nbsp;&nbsp;&nbsp; | &nbsp;&nbsp;&nbsp; 순천방향: 0k → 106.8k",
-                       showarrow=False, font=dict(size=12, color="rgb(90,90,90)"))
-
-    # 선택된 교량/터널 표시
-    for i, (_, row) in enumerate(selected_df.iterrows(), start=1):
-        actual_start, actual_end, visual_start, visual_end = calc_span(row["이정_km"], row.get("연장_m"))
-        label = f"#{i}"
-        hover = (
-            f"<b>{row['시설명']}</b><br>"
-            f"구분: {row['시설구분']}<br>"
-            f"종별: {row['종별표시']}<br>"
-            f"방향: {row['방향']}<br>"
-            f"이정: {row['이정_km']:.2f}k<br>"
-            f"연장: {row.get('연장_m', float('nan')):,.0f}m<br>"
-            f"실제 추정구간: {actual_start:.3f}k ~ {actual_end:.3f}k"
-        )
-
-        for y0, y1 in direction_bands(row["방향"]):
-            fig.add_shape(
-                type="rect",
-                x0=visual_start, x1=visual_end, y0=y0, y1=y1,
-                fillcolor="rgba(130,130,130,0.55)",
-                line=dict(color="rgb(60,60,60)", width=2),
-            )
-            fig.add_trace(go.Scatter(
-                x=[(visual_start + visual_end) / 2],
-                y=[(y0 + y1) / 2],
-                mode="text",
-                text=[f"<b>{label}</b>"],
-                textfont=dict(size=14, color="black"),
-                hovertext=[hover],
-                hoverinfo="text",
-                showlegend=False,
-            ))
-
-        # 도식 위 설명은 너무 긴 이름이 겹치지 않도록 번호만 도식에 넣고, 상세 표에서 풀어준다.
-
-    fig.update_xaxes(range=[-6, ROUTE_MAX_KM + 6], visible=False, fixedrange=True)
-    fig.update_yaxes(range=[-0.2, 6.9], visible=False, fixedrange=True)
-    fig.update_layout(
-        title=dict(text=title, x=0.5, xanchor="center"),
-        height=450,
-        margin=dict(l=35, r=45, t=75, b=25),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        hoverlabel=dict(bgcolor="white", font_size=13),
-    )
-    return fig
-
-
-# =========================================================
-# 7. Streamlit 화면 구성
-# =========================================================
-def show_facility_tab(df: pd.DataFrame, kind: str):
-    st.subheader(f"{kind} 위치 검색")
-
-    query = st.text_input(
-        f"{kind}명 검색",
-        placeholder=f"예: ㅅ, ㅅㄷ, 서, 서영암, 강진 ...",
-        key=f"{kind}_query",
-    )
-
-    result_df = search_facilities(df, query)
-
-    if result_df.empty:
-        st.warning("검색 결과가 없습니다. 초성 또는 시설물명을 다시 입력해 주세요.")
-        return
-
-    option_map = {idx: make_option_label(row) for idx, row in result_df.iterrows()}
-    selected_idx = st.selectbox(
-        f"표시할 {kind} 선택",
-        options=list(option_map.keys()),
-        format_func=lambda idx: option_map[idx],
-        key=f"{kind}_select",
-    )
-
-    selected_row = df.loc[[selected_idx]].copy()
-
-    show_same_base = st.checkbox(
-        "같은 이름의 반대방향/공용 시설도 함께 표시",
-        value=True,
-        key=f"{kind}_same_base",
-    )
-
-    if show_same_base:
-        base_name = selected_row.iloc[0]["기본시설명"]
-        selected_df = df[df["기본시설명"].eq(base_name)].copy()
+    if item["연장_m"]:
+        length_text = f"{item['연장_m']:,.0f}m"
     else:
-        selected_df = selected_row
+        length_text = "연장 정보 없음"
 
-    fig = draw_route_map(selected_df, f"보성지사 남해선(영암순천) {kind} 개략 위치")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # 상세 정보 표
-    detail = selected_df.copy()
-    detail["추정 시작(k)"], detail["추정 종료(k)"] = zip(*detail.apply(
-        lambda r: calc_span(r["이정_km"], r.get("연장_m"))[:2], axis=1
-    ))
-    detail["연장(m)"] = detail["연장_m"].round(1)
-    detail["이정(k)"] = detail["이정_km"].round(3)
-
-    show_cols = ["시설명", "시설구분", "방향", "종별표시", "이정(k)", "연장(m)", "추정 시작(k)", "추정 종료(k)"]
-    st.markdown("#### 선택 시설 정보")
-    st.dataframe(
-        detail[show_cols],
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    st.caption(
-        "※ 추정 시작/종료는 이정을 중심으로 연장의 절반을 좌우에 배치해 계산했습니다. "
-        "실제 관리대장상의 시·종점 이정과는 다를 수 있으며, 위치 기억용 개략 도식입니다."
+    return (
+        f"{item['시설명']} | "
+        f"{item['방향']} | "
+        f"{item['이정']:.2f}k | "
+        f"{length_text} | "
+        f"{item['종별']}"
     )
 
 
-def main():
-    st.set_page_config(page_title="보성지사 교량·터널 위치 검색", layout="wide")
+def select_related_items(items, selected, include_related=True):
+    """
+    선택한 시설과 같은 이름의 반대방향 시설을 함께 표시한다.
+    """
+    if not selected:
+        return []
 
-    st.title("보성지사 교량·터널 개략 위치 검색")
-    st.write(
-        "남해선(영암순천) 0k ~ 106.84k 구간에서 교량 또는 터널명을 검색하면 "
-        "IC 기준 개략 위치와 방향별 위치를 표시합니다."
+    if not include_related:
+        return [selected]
+
+    related = []
+
+    for item in items:
+        if item["기본명"] == selected["기본명"]:
+            related.append(item)
+
+    related.sort(key=lambda x: (x["방향"], x["이정"], x["시설명"]))
+
+    return related
+
+
+# =========================================================
+# 6. SVG 도식 생성
+# =========================================================
+
+def km_to_x(km):
+    """
+    이정 km 값을 SVG의 x 좌표로 변환한다.
+    """
+    km = max(ROAD_START_KM, min(ROAD_END_KM, km))
+    ratio = (km - ROAD_START_KM) / (ROAD_END_KM - ROAD_START_KM)
+    x = LEFT + ratio * ROAD_W
+    return x
+
+
+def make_rect_positions(item, item_index):
+    """
+    시설의 실제 시작/종점과 화면상 표시 시작/종점을 계산한다.
+
+    실제 위치:
+    이정을 중심으로 연장/2만큼 앞뒤로 계산
+
+    화면 표시 위치:
+    짧은 교량은 실제 축척대로 그리면 너무 작아서 최소 표시 폭을 적용
+    """
+    km = item["이정"]
+    length_km = max(item["연장_m"], 0.0) / 1000.0
+    half = length_km / 2.0
+
+    real_start = max(ROAD_START_KM, km - half)
+    real_end = min(ROAD_END_KM, km + half)
+
+    if item["구분"] == "터널":
+        min_width = MIN_VISUAL_WIDTH_KM_TUNNEL
+    else:
+        min_width = MIN_VISUAL_WIDTH_KM_BRIDGE
+
+    visual_width_km = max(length_km, min_width)
+
+    visual_start = max(ROAD_START_KM, km - visual_width_km / 2.0)
+    visual_end = min(ROAD_END_KM, km + visual_width_km / 2.0)
+
+    if visual_end - visual_start < min_width and visual_start <= ROAD_START_KM:
+        visual_end = min(ROAD_END_KM, visual_start + min_width)
+
+    if visual_end - visual_start < min_width and visual_end >= ROAD_END_KM:
+        visual_start = max(ROAD_START_KM, visual_end - min_width)
+
+    return real_start, real_end, visual_start, visual_end
+
+
+def draw_facility(svg, item, item_index, target_direction):
+    """
+    SVG 위에 선택된 시설을 사각형으로 그린다.
+    """
+    real_start, real_end, visual_start, visual_end = make_rect_positions(item, item_index)
+
+    x1 = km_to_x(visual_start)
+    x2 = km_to_x(visual_end)
+    w = max(7, x2 - x1)
+
+    if target_direction == "영암방향":
+        y = 140 + (item_index % 2) * 18
+    else:
+        y = 305 + (item_index % 2) * 18
+
+    if item["구분"] == "터널":
+        h = 48
+        fill = "#9fb7d9"
+    else:
+        h = 36
+        fill = "#bdbdbd"
+
+    stroke = "#333333"
+
+    label = f"#{item_index + 1} {item['시설명']}"
+
+    if item["연장_m"]:
+        length_text = f"{item['연장_m']:,.0f}m"
+    else:
+        length_text = "연장 정보 없음"
+
+    title = (
+        f"{item['시설명']} / "
+        f"{item['방향']} / "
+        f"이정 {item['이정']:.2f}k / "
+        f"개략구간 {real_start:.2f}k~{real_end:.2f}k / "
+        f"연장 {length_text}"
     )
 
-    with st.expander("사용 방법", expanded=False):
-        st.markdown(
-            """
-            - `ㅅ`처럼 초성만 입력하면 초성이 일치하는 시설물이 검색됩니다.
-            - `서`, `서영암`, `강진`처럼 실제 글자를 입력해도 검색됩니다.
-            - 시설물명에 `(순천)`이 있으면 아래쪽 순천방향, `(영암)`이 있으면 위쪽 영암방향에 표시합니다.
-            - 방향 표기가 없는 시설물은 양방향/공용으로 보고 양쪽에 모두 표시합니다.
-            - 교량은 연장이 짧아 실제 축척대로 그리면 거의 보이지 않으므로, 도식에서는 최소 폭을 적용합니다.
-            """
+    svg.append("<g>")
+    svg.append(f"<title>{html.escape(title)}</title>")
+
+    svg.append(
+        f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{h}" '
+        f'rx="2" fill="{fill}" stroke="{stroke}" stroke-width="1.5" opacity="0.92" />'
+    )
+
+    text_x = x1 + w / 2
+    text_anchor = "middle"
+
+    if w < 95:
+        if x1 > SVG_W - 250:
+            text_x = x1 - 5
+            text_anchor = "end"
+        else:
+            text_x = x1 + w + 5
+            text_anchor = "start"
+
+    text_y = y + h / 2 + 4
+
+    svg.append(
+        f'<text x="{text_x:.1f}" y="{text_y:.1f}" '
+        f'text-anchor="{text_anchor}" class="facility-label">'
+        f'{html.escape(label)}</text>'
+    )
+
+    svg.append("</g>")
+
+
+def make_svg(selected_items):
+    """
+    전체 도로 도식 SVG를 만든다.
+    """
+    svg = []
+
+    svg.append(f"""
+    <svg viewBox="0 0 {SVG_W} {SVG_H}" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">
+    <style>
+        .ic-label {{
+            font-size: 19px;
+            fill: #2449ff;
+            font-weight: 800;
+        }}
+
+        .tick-label {{
+            font-size: 16px;
+            fill: #555555;
+        }}
+
+        .side-label {{
+            font-size: 17px;
+            fill: #333333;
+            font-weight: 700;
+        }}
+
+        .lane-label {{
+            font-size: 15px;
+            fill: #555555;
+        }}
+
+        .facility-label {{
+            font-size: 14px;
+            fill: #333333;
+            font-weight: 800;
+        }}
+
+        .small-note {{
+            font-size: 13px;
+            fill: #777777;
+        }}
+    </style>
+
+    <rect x="0" y="0" width="{SVG_W}" height="{SVG_H}" fill="#ffffff" />
+    """)
+
+    for ic_name, km in IC_POINTS.items():
+        x = km_to_x(km)
+        y = 26
+        text_anchor = "middle"
+
+        if km <= ROAD_START_KM + 0.1:
+            text_anchor = "start"
+            x = x - 25
+        elif km >= ROAD_END_KM - 0.1:
+            text_anchor = "end"
+            x = x + 30
+
+        svg.append(
+            f'<text x="{x:.1f}" y="{y}" text-anchor="{text_anchor}" class="ic-label">'
+            f'{html.escape(ic_name)}</text>'
         )
 
-    try:
-        bridge_df, tunnel_df = load_all_data()
-    except Exception as e:
-        st.error("데이터를 불러오지 못했습니다.")
-        st.exception(e)
-        st.info("app.py와 같은 폴더에 bridgedata.csv, tunneldata.csv 파일이 있는지 확인해 주세요.")
+    ticks = list(range(0, 101, 10)) + [107]
+
+    for tick in ticks:
+        if tick == 107:
+            km = ROAD_END_KM
+        else:
+            km = float(tick)
+
+        x = km_to_x(km)
+
+        if tick in [0, 20, 40, 60, 80, 100, 107]:
+            stroke_w = 2
+        else:
+            stroke_w = 1.3
+
+        svg.append(
+            f'<line x1="{x:.1f}" y1="52" x2="{x:.1f}" y2="418" '
+            f'stroke="#686868" stroke-width="{stroke_w}" />'
+        )
+
+        if tick == 107:
+            tick_text = "107k"
+        elif tick == 0:
+            tick_text = "0k"
+        else:
+            tick_text = str(tick)
+
+        svg.append(
+            f'<text x="{x:.1f}" y="47" text-anchor="middle" class="tick-label">'
+            f'{tick_text}</text>'
+        )
+
+    lane_ys = [52, 111, 170, 229, 288, 347, 418]
+
+    for y in lane_ys:
+        if y in [52, 418]:
+            stroke_w = 2
+        else:
+            stroke_w = 1.5
+
+        svg.append(
+            f'<line x1="{LEFT}" y1="{y}" x2="{LEFT + ROAD_W}" y2="{y}" '
+            f'stroke="#686868" stroke-width="{stroke_w}" />'
+        )
+
+    svg.append(
+        f'<line x1="{LEFT}" y1="229" x2="{LEFT + ROAD_W}" y2="229" '
+        f'stroke="#111111" stroke-width="6" />'
+    )
+
+    svg.append(
+        f'<rect x="{LEFT}" y="52" width="{ROAD_W}" height="366" '
+        f'fill="none" stroke="#595959" stroke-width="2" />'
+    )
+
+    svg.append('<text x="44" y="136" text-anchor="middle" class="side-label">영암</text>')
+    svg.append('<text x="44" y="158" text-anchor="middle" class="side-label">방향</text>')
+    svg.append('<text x="44" y="306" text-anchor="middle" class="side-label">순천</text>')
+    svg.append('<text x="44" y="328" text-anchor="middle" class="side-label">방향</text>')
+
+    right_x = LEFT + ROAD_W + 12
+
+    lane_labels = [
+        (82, "갓길"),
+        (141, "2차로"),
+        (200, "1차로"),
+        (259, "1차로"),
+        (318, "2차로"),
+        (383, "갓길"),
+    ]
+
+    for y, label in lane_labels:
+        svg.append(
+            f'<text x="{right_x}" y="{y}" class="lane-label">{label}</text>'
+        )
+
+    svg.append(
+        f'<text x="{LEFT + 8}" y="96" class="small-note">'
+        f'영암방향: 106.84k → 0k</text>'
+    )
+
+    svg.append(
+        f'<text x="{LEFT + 8}" y="403" class="small-note">'
+        f'순천방향: 0k → 106.84k</text>'
+    )
+
+    svg.append(
+        f'<text x="{LEFT + ROAD_W - 90}" y="96" class="small-note">←</text>'
+    )
+
+    svg.append(
+        f'<text x="{LEFT + ROAD_W - 90}" y="403" class="small-note">→</text>'
+    )
+
+    for idx, item in enumerate(selected_items):
+        if item["방향"] == "영암방향":
+            draw_facility(svg, item, idx, "영암방향")
+        elif item["방향"] == "순천방향":
+            draw_facility(svg, item, idx, "순천방향")
+        else:
+            draw_facility(svg, item, idx, "영암방향")
+            draw_facility(svg, item, idx, "순천방향")
+
+    svg.append("</svg>")
+
+    return "".join(svg)
+
+
+# =========================================================
+# 7. 선택 시설 정보 표
+# =========================================================
+
+def make_info_table(items):
+    """
+    선택한 교량/터널 정보를 HTML 표로 만든다.
+    """
+    if not items:
+        return ""
+
+    rows = []
+
+    for i, item in enumerate(items, start=1):
+        real_start, real_end, _, _ = make_rect_positions(item, i - 1)
+
+        if item["연장_m"]:
+            length_text = f"{item['연장_m']:,.0f}"
+        else:
+            length_text = ""
+
+        rows.append(f"""
+        <tr>
+            <td>#{i}</td>
+            <td>{html.escape(item["구분"])}</td>
+            <td><b>{html.escape(item["시설명"])}</b></td>
+            <td>{html.escape(item["방향"])}</td>
+            <td>{item["이정"]:.2f}k</td>
+            <td>{html.escape(length_text)} m</td>
+            <td>{html.escape(item["종별"])}</td>
+            <td>{real_start:.2f}k ~ {real_end:.2f}k</td>
+        </tr>
+        """)
+
+    table_html = f"""
+    <style>
+        .info-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }}
+
+        .info-table th {{
+            background: #f3f5f7;
+            border: 1px solid #d9dde3;
+            padding: 8px;
+            text-align: center;
+        }}
+
+        .info-table td {{
+            border: 1px solid #d9dde3;
+            padding: 8px;
+            text-align: center;
+        }}
+
+        .info-table td:nth-child(3) {{
+            text-align: left;
+        }}
+    </style>
+
+    <table class="info-table">
+        <thead>
+            <tr>
+                <th>번호</th>
+                <th>구분</th>
+                <th>시설명</th>
+                <th>방향</th>
+                <th>이정</th>
+                <th>연장</th>
+                <th>종별</th>
+                <th>개략 표시구간</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {"".join(rows)}
+        </tbody>
+    </table>
+    """
+
+    return table_html
+
+
+# =========================================================
+# 8. Streamlit 화면
+# =========================================================
+
+st.set_page_config(
+    page_title="보성지사 교량·터널 위치 찾기",
+    layout="wide",
+)
+
+st.title("보성지사 교량·터널 위치 찾기")
+
+st.caption(
+    "남해선 영암순천선 0k ~ 106.84k 구간에서 "
+    "교량과 터널의 개략적인 위치를 표시합니다."
+)
+
+try:
+    bridge_items, tunnel_items, meta = load_data()
+except Exception as e:
+    st.error(str(e))
+    st.stop()
+
+
+with st.sidebar:
+    st.subheader("데이터 확인")
+
+    st.write(f"교량: {meta['bridge_count']:,}개")
+    st.write(f"터널: {meta['tunnel_count']:,}개")
+
+    st.caption(f"교량 CSV 인코딩: {meta['bridge_encoding']}")
+    st.caption(f"터널 CSV 인코딩: {meta['tunnel_encoding']}")
+
+    st.divider()
+
+    include_related = st.checkbox(
+        "같은 시설의 반대방향/공용 자료도 함께 표시",
+        value=True,
+    )
+
+    st.divider()
+
+    st.markdown("### IC 이정")
+
+    for ic_name, km in IC_POINTS.items():
+        st.write(f"{ic_name}: {km:g}k")
+
+
+tab_bridge, tab_tunnel = st.tabs(["교량명 검색", "터널명 검색"])
+
+
+def render_search_tab(items, search_label, select_label, key_prefix):
+    """
+    교량 탭과 터널 탭에서 공통으로 사용하는 화면 구성 함수
+    """
+    keyword = st.text_input(
+        search_label,
+        placeholder="예: ㅅ, ㅅㅇㅇ, 서, 서영암, 강진",
+        key=f"{key_prefix}_keyword",
+    )
+
+    results = search_items(items, keyword)
+
+    if not results:
+        st.warning("검색 결과가 없습니다. 초성 또는 시설명 일부를 다시 입력해보세요.")
+        components.html(make_svg([]), height=430, scrolling=False)
         return
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("교량 데이터", f"{len(bridge_df):,}개")
-    col2.metric("터널 데이터", f"{len(tunnel_df):,}개")
-    col3.metric("관리구간", f"{ROUTE_MIN_KM:g}k ~ {ROUTE_MAX_KM:g}k")
+    selected = st.selectbox(
+        select_label,
+        options=results,
+        format_func=format_option,
+        key=f"{key_prefix}_select",
+    )
 
-    tab_bridge, tab_tunnel = st.tabs(["교량명 검색", "터널명 검색"])
-    with tab_bridge:
-        show_facility_tab(bridge_df, "교량")
-    with tab_tunnel:
-        show_facility_tab(tunnel_df, "터널")
+    selected_items = select_related_items(
+        items,
+        selected,
+        include_related=include_related,
+    )
+
+    st.markdown("#### 위치 도식")
+
+    components.html(
+        make_svg(selected_items),
+        height=430,
+        scrolling=False,
+    )
+
+    st.markdown("#### 선택 시설 정보")
+
+    st.markdown(
+        make_info_table(selected_items),
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("검색 결과 목록 보기"):
+        for item in results[:50]:
+            st.write(format_option(item))
 
 
-if __name__ == "__main__":
-    main()
+with tab_bridge:
+    render_search_tab(
+        bridge_items,
+        "교량명 또는 초성을 입력하세요",
+        "표시할 교량을 선택하세요",
+        "bridge",
+    )
+
+
+with tab_tunnel:
+    render_search_tab(
+        tunnel_items,
+        "터널명 또는 초성을 입력하세요",
+        "표시할 터널을 선택하세요",
+        "tunnel",
+    )
+
+
+st.divider()
+
+st.markdown("""
+#### 로직 요약
+
+1. `bridgedata.csv`, `tunneldata.csv`를 읽습니다.
+2. `지사` 컬럼이 `보성지사`인 행만 남깁니다.
+3. `이정`은 km, `연장`은 m 단위로 해석합니다.
+4. 시설명 괄호의 `(순천)`, `(영암)`을 기준으로 방향을 나눕니다.
+5. 한글 시설명을 초성 문자열로 변환해서 `ㅅ`, `ㅅㅇㅇ`, `ㄱㅈ` 같은 검색이 가능하게 합니다.
+6. 선택 시설의 이정을 중심으로 `연장 / 2`만큼 앞뒤를 계산해 개략 위치를 표시합니다.
+7. 연장이 짧은 교량은 화면에서 너무 작게 보이지 않도록 최소 표시 폭을 적용합니다.
+""")
