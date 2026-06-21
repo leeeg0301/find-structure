@@ -29,11 +29,12 @@ BRANCH_NAME = "보성지사"
 BRIDGE_FILE = "bridgedata.csv"
 TUNNEL_FILE = "tunneldata.csv"
 
-MIN_VISUAL_WIDTH_KM_BRIDGE = 0.65
-MIN_VISUAL_WIDTH_KM_TUNNEL = 0.9
+# 전체 106.84km를 한 화면에 그리면 150m 교량은 너무 작아서 거의 안 보임
+# 그래서 실제 연장을 반영하되, 너무 짧은 시설은 최소 6px로 보이게 처리
+MIN_VISIBLE_PIXEL = 6
 
 SVG_W = 1180
-SVG_H = 455
+SVG_H = 315
 LEFT = 82
 RIGHT = 60
 ROAD_W = SVG_W - LEFT - RIGHT
@@ -51,10 +52,10 @@ CHOSUNG_LIST = [
 
 def normalize_text(value):
     """
-    검색 비교를 쉽게 하기 위해
-    1) None을 빈 문자열로 바꾸고
-    2) 공백을 제거하고
-    3) 영문은 소문자로 바꾼다.
+    검색 비교를 쉽게 하기 위해 문자열을 정리한다.
+    - None -> ""
+    - 공백 제거
+    - 영문 소문자 변환
     """
     if value is None:
         return ""
@@ -62,12 +63,13 @@ def normalize_text(value):
     text = str(value)
     text = re.sub(r"\s+", "", text)
     text = text.lower()
+
     return text
 
 
 def make_chosung(value):
     """
-    한글 문자열을 초성 문자열로 바꾼다.
+    한글 문자열을 초성 문자열로 변환한다.
 
     예)
     서영암IC교 -> ㅅㅇㅇicㄱ
@@ -89,13 +91,13 @@ def make_chosung(value):
 
 
 # =========================================================
-# 3. CSV 읽기
+# 3. CSV 읽기 및 값 정리
 # =========================================================
 
 def read_csv_auto(path):
     """
     CSV 파일을 읽는다.
-    도로공사 자료는 cp949인 경우가 많아서 여러 인코딩을 순서대로 시도한다.
+    공공기관/엑셀 CSV는 cp949인 경우가 많아서 여러 인코딩을 순서대로 시도한다.
     """
     encodings = ["utf-8-sig", "cp949", "euc-kr", "utf-8"]
     last_error = None
@@ -105,7 +107,9 @@ def read_csv_auto(path):
             with open(path, "r", encoding=enc, newline="") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-                return rows, enc
+
+            return rows, enc
+
         except Exception as e:
             last_error = e
 
@@ -129,13 +133,13 @@ def clean_value(value):
 
 def to_float(value, default=None):
     """
-    이정, 연장 같은 값을 숫자로 바꾼다.
+    이정, 연장 값을 숫자로 바꾼다.
 
     예)
     106.84 -> 106.84
     1,234 -> 1234
     106.8k -> 106.8
-    30m -> 30
+    150m -> 150
     """
     if value is None:
         return default
@@ -156,6 +160,24 @@ def to_float(value, default=None):
         return default
 
 
+def get_value(row, candidate_columns):
+    """
+    CSV 컬럼명이 약간 다를 수 있어서 후보 컬럼 중 존재하는 값을 가져온다.
+    """
+    for col in candidate_columns:
+        if col in row:
+            return row.get(col)
+
+    # 컬럼명 앞뒤 공백이 있는 경우 보정
+    stripped_map = {str(k).strip(): v for k, v in row.items()}
+
+    for col in candidate_columns:
+        if col in stripped_map:
+            return stripped_map.get(col)
+
+    return ""
+
+
 # =========================================================
 # 4. 시설명, 방향, 데이터 구조 정리
 # =========================================================
@@ -165,12 +187,11 @@ def get_direction(name):
     시설명 괄호 안에 있는 방향 정보를 읽는다.
 
     예)
-    서영암IC교(순천) -> 순천방향
-    서영암IC교(영암) -> 영암방향
+    남해청룡1교(순천) -> 순천방향
+    남해청룡1교(영암) -> 영암방향
     방향 표시 없음 -> 양방향/공용
     """
     text = str(name)
-
     paren_values = re.findall(r"\((.*?)\)", text)
     paren_text = " ".join(paren_values)
 
@@ -188,8 +209,8 @@ def base_name(name):
     같은 시설의 순천/영암 방향을 묶기 위해 괄호 방향 표기를 제거한다.
 
     예)
-    서영암IC교(순천) -> 서영암IC교
-    서영암IC교(영암) -> 서영암IC교
+    남해청룡1교(순천) -> 남해청룡1교
+    남해청룡1교(영암) -> 남해청룡1교
     """
     text = str(name)
     text = re.sub(r"\((순천|영암)\)", "", text)
@@ -198,21 +219,31 @@ def base_name(name):
 
 def build_item(row, item_type):
     """
-    CSV 한 행을 앱에서 사용하기 좋은 공통 구조로 변환한다.
-    교량과 터널의 컬럼명이 조금 다르므로 여기에서 맞춰준다.
+    CSV 한 행을 앱에서 쓰기 좋은 구조로 변환한다.
     """
     if item_type == "bridge":
-        name_col = "교량명"
-        type_col = "종별구분"
         category_name = "교량"
-    else:
-        name_col = "터널명"
-        type_col = "종별"
-        category_name = "터널"
+        name = clean_value(
+            get_value(row, ["교량명", "시설명", "구조물명", "명칭"])
+        )
+        type_value = clean_value(
+            get_value(row, ["종별구분", "종별", "교량종별", "구분"])
+        )
 
-    name = clean_value(row.get(name_col))
-    km = to_float(row.get("이정"))
-    length_m = to_float(row.get("연장"), 0.0)
+    else:
+        category_name = "터널"
+        name = clean_value(
+            get_value(row, ["터널명", "시설명", "구조물명", "명칭"])
+        )
+        type_value = clean_value(
+            get_value(row, ["종별", "종별구분", "터널종별", "구분"])
+        )
+
+    branch = clean_value(get_value(row, ["지사", "관리지사"]))
+    road = clean_value(get_value(row, ["노선", "노선명"]))
+
+    km = to_float(get_value(row, ["이정", "중심이정", "시점이정", "위치"]))
+    length_m = to_float(get_value(row, ["연장", "총연장", "길이"]), 0.0)
 
     if not name:
         return None
@@ -230,9 +261,9 @@ def build_item(row, item_type):
         "방향": get_direction(name),
         "이정": km,
         "연장_m": length_m or 0.0,
-        "종별": clean_value(row.get(type_col)),
-        "노선": clean_value(row.get("노선")),
-        "지사": clean_value(row.get("지사")),
+        "종별": type_value,
+        "노선": road,
+        "지사": branch,
         "초성": make_chosung(name),
         "검색명": normalize_text(name),
         "검색기본명": normalize_text(base_name(name)),
@@ -244,7 +275,7 @@ def build_item(row, item_type):
 @st.cache_data(show_spinner=False)
 def load_data():
     """
-    교량과 터널 CSV를 읽고 보성지사 데이터만 추출한다.
+    bridgedata.csv, tunneldata.csv를 읽고 보성지사 자료만 남긴다.
     """
     base_dir = Path(__file__).resolve().parent
 
@@ -272,7 +303,7 @@ def load_data():
     tunnel_items = []
 
     for row in bridge_rows:
-        branch = clean_value(row.get("지사"))
+        branch = clean_value(get_value(row, ["지사", "관리지사"]))
 
         if BRANCH_NAME in branch:
             item = build_item(row, "bridge")
@@ -281,7 +312,7 @@ def load_data():
                 bridge_items.append(item)
 
     for row in tunnel_rows:
-        branch = clean_value(row.get("지사"))
+        branch = clean_value(get_value(row, ["지사", "관리지사"]))
 
         if BRANCH_NAME in branch:
             item = build_item(row, "tunnel")
@@ -312,9 +343,9 @@ def search_items(items, keyword, limit=80):
 
     검색 우선순위
     1. 시설명이 검색어로 시작
-    2. 괄호 제거한 시설명이 검색어로 시작
+    2. 괄호 제거 시설명이 검색어로 시작
     3. 시설명 안에 검색어 포함
-    4. 괄호 제거한 시설명 안에 검색어 포함
+    4. 괄호 제거 시설명 안에 검색어 포함
     5. 초성이 검색어로 시작
     6. 초성 안에 검색어 포함
     """
@@ -363,12 +394,14 @@ def format_option(item):
     else:
         length_text = "연장 정보 없음"
 
+    type_text = item["종별"] if item["종별"] else "종별 정보 없음"
+
     return (
         f"{item['시설명']} | "
         f"{item['방향']} | "
         f"{item['이정']:.2f}k | "
         f"{length_text} | "
-        f"{item['종별']}"
+        f"{type_text}"
     )
 
 
@@ -394,7 +427,7 @@ def select_related_items(items, selected, include_related=True):
 
 
 # =========================================================
-# 6. SVG 도식 생성
+# 6. SVG 위치 도식
 # =========================================================
 
 def km_to_x(km):
@@ -404,82 +437,85 @@ def km_to_x(km):
     km = max(ROAD_START_KM, min(ROAD_END_KM, km))
     ratio = (km - ROAD_START_KM) / (ROAD_END_KM - ROAD_START_KM)
     x = LEFT + ratio * ROAD_W
+
     return x
 
 
-def make_rect_positions(item, item_index):
+def make_rect_positions(item):
     """
-    시설의 실제 시작/종점과 화면상 표시 시작/종점을 계산한다.
+    시설의 실제 시작/종점과 화면 표시 폭을 계산한다.
 
-    실제 위치:
-    이정을 중심으로 연장/2만큼 앞뒤로 계산
-
-    화면 표시 위치:
-    짧은 교량은 실제 축척대로 그리면 너무 작아서 최소 표시 폭을 적용
+    원칙:
+    - 이정(km)을 중심으로 연장(m)을 km로 환산해서 좌우로 나눠 표시한다.
+    - 예: 이정 35.00k, 연장 150m이면
+      실제 표시구간은 34.925k ~ 35.075k
+    - 단, 전체 노선이 106.84km라서 150m는 화면에서 약 1~2px밖에 안 된다.
+      그래서 너무 짧은 시설은 최소 6px로 보이게 한다.
     """
-    km = item["이정"]
+    center_km = item["이정"]
     length_km = max(item["연장_m"], 0.0) / 1000.0
-    half = length_km / 2.0
 
-    real_start = max(ROAD_START_KM, km - half)
-    real_end = min(ROAD_END_KM, km + half)
+    if length_km <= 0:
+        length_km = 0.03
 
-    if item["구분"] == "터널":
-        min_width = MIN_VISUAL_WIDTH_KM_TUNNEL
-    else:
-        min_width = MIN_VISUAL_WIDTH_KM_BRIDGE
+    real_start = max(ROAD_START_KM, center_km - length_km / 2)
+    real_end = min(ROAD_END_KM, center_km + length_km / 2)
 
-    visual_width_km = max(length_km, min_width)
+    center_x = km_to_x(center_km)
+    x1 = km_to_x(real_start)
+    x2 = km_to_x(real_end)
 
-    visual_start = max(ROAD_START_KM, km - visual_width_km / 2.0)
-    visual_end = min(ROAD_END_KM, km + visual_width_km / 2.0)
+    width_px = max(x2 - x1, MIN_VISIBLE_PIXEL)
 
-    if visual_end - visual_start < min_width and visual_start <= ROAD_START_KM:
-        visual_end = min(ROAD_END_KM, visual_start + min_width)
+    visual_x1 = center_x - width_px / 2
+    visual_x2 = center_x + width_px / 2
 
-    if visual_end - visual_start < min_width and visual_end >= ROAD_END_KM:
-        visual_start = max(ROAD_START_KM, visual_end - min_width)
+    if visual_x1 < LEFT:
+        visual_x1 = LEFT
+        visual_x2 = LEFT + width_px
 
-    return real_start, real_end, visual_start, visual_end
+    if visual_x2 > LEFT + ROAD_W:
+        visual_x2 = LEFT + ROAD_W
+        visual_x1 = visual_x2 - width_px
+
+    return real_start, real_end, visual_x1, visual_x2
 
 
 def draw_facility(svg, item, item_index, target_direction):
     """
-    SVG 위에 선택된 시설을 사각형으로 그린다.
+    선택된 시설을 도식 위에 표시한다.
     """
-    real_start, real_end, visual_start, visual_end = make_rect_positions(item, item_index)
+    real_start, real_end, x1, x2 = make_rect_positions(item)
 
-    x1 = km_to_x(visual_start)
-    x2 = km_to_x(visual_end)
-    w = max(7, x2 - x1)
+    w = max(MIN_VISIBLE_PIXEL, x2 - x1)
 
     if target_direction == "영암방향":
-        y = 140 + (item_index % 2) * 18
+        y = 92
     else:
-        y = 305 + (item_index % 2) * 18
+        y = 205
 
     if item["구분"] == "터널":
-        h = 48
-        fill = "#9fb7d9"
+        h = 26
+        fill = "#8fb4dd"
     else:
-        h = 36
-        fill = "#bdbdbd"
+        h = 20
+        fill = "#9e9e9e"
 
     stroke = "#333333"
-
-    label = f"#{item_index + 1} {item['시설명']}"
 
     if item["연장_m"]:
         length_text = f"{item['연장_m']:,.0f}m"
     else:
         length_text = "연장 정보 없음"
 
+    label = f"{item['시설명']} / {length_text}"
+
     title = (
         f"{item['시설명']} / "
         f"{item['방향']} / "
         f"이정 {item['이정']:.2f}k / "
-        f"개략구간 {real_start:.2f}k~{real_end:.2f}k / "
-        f"연장 {length_text}"
+        f"연장 {length_text} / "
+        f"개략구간 {real_start:.3f}k~{real_end:.3f}k"
     )
 
     svg.append("<g>")
@@ -487,26 +523,39 @@ def draw_facility(svg, item, item_index, target_direction):
 
     svg.append(
         f'<rect x="{x1:.1f}" y="{y}" width="{w:.1f}" height="{h}" '
-        f'rx="2" fill="{fill}" stroke="{stroke}" stroke-width="1.5" opacity="0.92" />'
+        f'rx="3" fill="{fill}" stroke="{stroke}" stroke-width="1.3" opacity="0.95" />'
     )
 
-    text_x = x1 + w / 2
-    text_anchor = "middle"
+    center_x = x1 + w / 2
 
-    if w < 95:
-        if x1 > SVG_W - 250:
-            text_x = x1 - 5
+    # 시설이 짧으면 글씨를 막대 오른쪽에 표시
+    if w < 90:
+        text_x = x2 + 8
+        text_anchor = "start"
+
+        if text_x > SVG_W - 240:
+            text_x = x1 - 8
             text_anchor = "end"
-        else:
-            text_x = x1 + w + 5
-            text_anchor = "start"
-
-    text_y = y + h / 2 + 4
+    else:
+        text_x = center_x
+        text_anchor = "middle"
 
     svg.append(
-        f'<text x="{text_x:.1f}" y="{text_y:.1f}" '
+        f'<text x="{text_x:.1f}" y="{y - 8}" '
         f'text-anchor="{text_anchor}" class="facility-label">'
         f'{html.escape(label)}</text>'
+    )
+
+    # 중심 이정 표시
+    svg.append(
+        f'<line x1="{center_x:.1f}" y1="{y + h}" x2="{center_x:.1f}" y2="{y + h + 16}" '
+        f'stroke="#333333" stroke-width="1.2" stroke-dasharray="3,3" />'
+    )
+
+    svg.append(
+        f'<text x="{center_x:.1f}" y="{y + h + 31}" '
+        f'text-anchor="middle" class="km-label">'
+        f'{item["이정"]:.2f}k</text>'
     )
 
     svg.append("</g>")
@@ -514,7 +563,13 @@ def draw_facility(svg, item, item_index, target_direction):
 
 def make_svg(selected_items):
     """
-    전체 도로 도식 SVG를 만든다.
+    전체 노선 도식 SVG를 만든다.
+
+    단순화 버전:
+    - 위쪽: 영암방향
+    - 아래쪽: 순천방향
+    - 차로/갓길 구분 없음
+    - IC 위치와 선택 시설만 표시
     """
     svg = []
 
@@ -522,31 +577,31 @@ def make_svg(selected_items):
     <svg viewBox="0 0 {SVG_W} {SVG_H}" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">
     <style>
         .ic-label {{
-            font-size: 19px;
+            font-size: 18px;
             fill: #2449ff;
             font-weight: 800;
         }}
 
         .tick-label {{
-            font-size: 16px;
+            font-size: 14px;
             fill: #555555;
         }}
 
-        .side-label {{
-            font-size: 17px;
+        .direction-label {{
+            font-size: 18px;
             fill: #333333;
-            font-weight: 700;
-        }}
-
-        .lane-label {{
-            font-size: 15px;
-            fill: #555555;
+            font-weight: 800;
         }}
 
         .facility-label {{
             font-size: 14px;
-            fill: #333333;
+            fill: #222222;
             font-weight: 800;
+        }}
+
+        .km-label {{
+            font-size: 12px;
+            fill: #555555;
         }}
 
         .small-note {{
@@ -558,9 +613,10 @@ def make_svg(selected_items):
     <rect x="0" y="0" width="{SVG_W}" height="{SVG_H}" fill="#ffffff" />
     """)
 
+    # IC 이름 표시
     for ic_name, km in IC_POINTS.items():
         x = km_to_x(km)
-        y = 26
+        y = 28
         text_anchor = "middle"
 
         if km <= ROAD_START_KM + 0.1:
@@ -575,100 +631,78 @@ def make_svg(selected_items):
             f'{html.escape(ic_name)}</text>'
         )
 
+    # 세로 기준선과 km 숫자
     ticks = list(range(0, 101, 10)) + [107]
 
     for tick in ticks:
         if tick == 107:
             km = ROAD_END_KM
+            tick_text = "106.84"
         else:
             km = float(tick)
+            tick_text = f"{tick}"
 
         x = km_to_x(km)
 
         if tick in [0, 20, 40, 60, 80, 100, 107]:
-            stroke_w = 2
-        else:
-            stroke_w = 1.3
-
-        svg.append(
-            f'<line x1="{x:.1f}" y1="52" x2="{x:.1f}" y2="418" '
-            f'stroke="#686868" stroke-width="{stroke_w}" />'
-        )
-
-        if tick == 107:
-            tick_text = "107k"
-        elif tick == 0:
-            tick_text = "0k"
-        else:
-            tick_text = str(tick)
-
-        svg.append(
-            f'<text x="{x:.1f}" y="47" text-anchor="middle" class="tick-label">'
-            f'{tick_text}</text>'
-        )
-
-    lane_ys = [52, 111, 170, 229, 288, 347, 418]
-
-    for y in lane_ys:
-        if y in [52, 418]:
-            stroke_w = 2
-        else:
             stroke_w = 1.5
+            stroke_color = "#999999"
+        else:
+            stroke_w = 0.8
+            stroke_color = "#dddddd"
 
         svg.append(
-            f'<line x1="{LEFT}" y1="{y}" x2="{LEFT + ROAD_W}" y2="{y}" '
-            f'stroke="#686868" stroke-width="{stroke_w}" />'
+            f'<line x1="{x:.1f}" y1="45" x2="{x:.1f}" y2="265" '
+            f'stroke="{stroke_color}" stroke-width="{stroke_w}" />'
         )
 
-    svg.append(
-        f'<line x1="{LEFT}" y1="229" x2="{LEFT + ROAD_W}" y2="229" '
-        f'stroke="#111111" stroke-width="6" />'
-    )
-
-    svg.append(
-        f'<rect x="{LEFT}" y="52" width="{ROAD_W}" height="366" '
-        f'fill="none" stroke="#595959" stroke-width="2" />'
-    )
-
-    svg.append('<text x="44" y="136" text-anchor="middle" class="side-label">영암</text>')
-    svg.append('<text x="44" y="158" text-anchor="middle" class="side-label">방향</text>')
-    svg.append('<text x="44" y="306" text-anchor="middle" class="side-label">순천</text>')
-    svg.append('<text x="44" y="328" text-anchor="middle" class="side-label">방향</text>')
-
-    right_x = LEFT + ROAD_W + 12
-
-    lane_labels = [
-        (82, "갓길"),
-        (141, "2차로"),
-        (200, "1차로"),
-        (259, "1차로"),
-        (318, "2차로"),
-        (383, "갓길"),
-    ]
-
-    for y, label in lane_labels:
         svg.append(
-            f'<text x="{right_x}" y="{y}" class="lane-label">{label}</text>'
+            f'<text x="{x:.1f}" y="284" text-anchor="middle" class="tick-label">'
+            f'{tick_text}k</text>'
         )
 
+    # 방향별 중심선
+    yam_y = 115
+    sun_y = 225
+
     svg.append(
-        f'<text x="{LEFT + 8}" y="96" class="small-note">'
-        f'영암방향: 106.84k → 0k</text>'
+        f'<line x1="{LEFT}" y1="{yam_y}" x2="{LEFT + ROAD_W}" y2="{yam_y}" '
+        f'stroke="#444444" stroke-width="5" stroke-linecap="round" />'
     )
 
     svg.append(
-        f'<text x="{LEFT + 8}" y="403" class="small-note">'
-        f'순천방향: 0k → 106.84k</text>'
+        f'<line x1="{LEFT}" y1="{sun_y}" x2="{LEFT + ROAD_W}" y2="{sun_y}" '
+        f'stroke="#444444" stroke-width="5" stroke-linecap="round" />'
+    )
+
+    # 방향 라벨
+    svg.append(
+        f'<text x="{LEFT - 48}" y="{yam_y + 6}" text-anchor="middle" class="direction-label">영암방향</text>'
     )
 
     svg.append(
-        f'<text x="{LEFT + ROAD_W - 90}" y="96" class="small-note">←</text>'
+        f'<text x="{LEFT - 48}" y="{sun_y + 6}" text-anchor="middle" class="direction-label">순천방향</text>'
+    )
+
+    # 방향 설명
+    svg.append(
+        f'<text x="{LEFT + ROAD_W - 105}" y="{yam_y - 18}" class="small-note">106.84k → 0k</text>'
     )
 
     svg.append(
-        f'<text x="{LEFT + ROAD_W - 90}" y="403" class="small-note">→</text>'
+        f'<text x="{LEFT + 8}" y="{sun_y - 18}" class="small-note">0k → 106.84k</text>'
     )
 
+    # 방향 화살표
+    svg.append(
+        f'<text x="{LEFT + 20}" y="{yam_y + 36}" class="direction-label">←</text>'
+    )
+
+    svg.append(
+        f'<text x="{LEFT + ROAD_W - 30}" y="{sun_y + 36}" class="direction-label">→</text>'
+    )
+
+    # 선택 시설 표시
     for idx, item in enumerate(selected_items):
         if item["방향"] == "영암방향":
             draw_facility(svg, item, idx, "영암방향")
@@ -684,90 +718,7 @@ def make_svg(selected_items):
 
 
 # =========================================================
-# 7. 선택 시설 정보 표
-# =========================================================
-
-def make_info_table(items):
-    """
-    선택한 교량/터널 정보를 HTML 표로 만든다.
-    """
-    if not items:
-        return ""
-
-    rows = []
-
-    for i, item in enumerate(items, start=1):
-        real_start, real_end, _, _ = make_rect_positions(item, i - 1)
-
-        if item["연장_m"]:
-            length_text = f"{item['연장_m']:,.0f}"
-        else:
-            length_text = ""
-
-        rows.append(f"""
-        <tr>
-            <td>#{i}</td>
-            <td>{html.escape(item["구분"])}</td>
-            <td><b>{html.escape(item["시설명"])}</b></td>
-            <td>{html.escape(item["방향"])}</td>
-            <td>{item["이정"]:.2f}k</td>
-            <td>{html.escape(length_text)} m</td>
-            <td>{html.escape(item["종별"])}</td>
-            <td>{real_start:.2f}k ~ {real_end:.2f}k</td>
-        </tr>
-        """)
-
-    table_html = f"""
-    <style>
-        .info-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 14px;
-        }}
-
-        .info-table th {{
-            background: #f3f5f7;
-            border: 1px solid #d9dde3;
-            padding: 8px;
-            text-align: center;
-        }}
-
-        .info-table td {{
-            border: 1px solid #d9dde3;
-            padding: 8px;
-            text-align: center;
-        }}
-
-        .info-table td:nth-child(3) {{
-            text-align: left;
-        }}
-    </style>
-
-    <table class="info-table">
-        <thead>
-            <tr>
-                <th>번호</th>
-                <th>구분</th>
-                <th>시설명</th>
-                <th>방향</th>
-                <th>이정</th>
-                <th>연장</th>
-                <th>종별</th>
-                <th>개략 표시구간</th>
-            </tr>
-        </thead>
-
-        <tbody>
-            {"".join(rows)}
-        </tbody>
-    </table>
-    """
-
-    return table_html
-
-
-# =========================================================
-# 8. Streamlit 화면
+# 7. Streamlit 화면 구성
 # =========================================================
 
 st.set_page_config(
@@ -822,7 +773,7 @@ def render_search_tab(items, search_label, select_label, key_prefix):
     """
     keyword = st.text_input(
         search_label,
-        placeholder="예: ㅅ, ㅅㅇㅇ, 서, 서영암, 강진",
+        placeholder="예: ㅅ, ㅅㅇㅇ, 서, 서영암, 남해청룡",
         key=f"{key_prefix}_keyword",
     )
 
@@ -830,15 +781,19 @@ def render_search_tab(items, search_label, select_label, key_prefix):
 
     if not results:
         st.warning("검색 결과가 없습니다. 초성 또는 시설명 일부를 다시 입력해보세요.")
-        components.html(make_svg([]), height=430, scrolling=False)
+        components.html(make_svg([]), height=330, scrolling=False)
         return
 
-    selected = st.selectbox(
+    option_indices = list(range(len(results)))
+
+    selected_index = st.selectbox(
         select_label,
-        options=results,
-        format_func=format_option,
+        options=option_indices,
+        format_func=lambda i: format_option(results[i]),
         key=f"{key_prefix}_select",
     )
+
+    selected = results[selected_index]
 
     selected_items = select_related_items(
         items,
@@ -846,19 +801,10 @@ def render_search_tab(items, search_label, select_label, key_prefix):
         include_related=include_related,
     )
 
-    st.markdown("#### 위치 도식")
-
     components.html(
         make_svg(selected_items),
-        height=430,
+        height=330,
         scrolling=False,
-    )
-
-    st.markdown("#### 선택 시설 정보")
-
-    st.markdown(
-        make_info_table(selected_items),
-        unsafe_allow_html=True,
     )
 
     with st.expander("검색 결과 목록 보기"):
@@ -887,13 +833,13 @@ with tab_tunnel:
 st.divider()
 
 st.markdown("""
-#### 로직 요약
+#### 작동 방식
 
 1. `bridgedata.csv`, `tunneldata.csv`를 읽습니다.
-2. `지사` 컬럼이 `보성지사`인 행만 남깁니다.
-3. `이정`은 km, `연장`은 m 단위로 해석합니다.
-4. 시설명 괄호의 `(순천)`, `(영암)`을 기준으로 방향을 나눕니다.
-5. 한글 시설명을 초성 문자열로 변환해서 `ㅅ`, `ㅅㅇㅇ`, `ㄱㅈ` 같은 검색이 가능하게 합니다.
-6. 선택 시설의 이정을 중심으로 `연장 / 2`만큼 앞뒤를 계산해 개략 위치를 표시합니다.
-7. 연장이 짧은 교량은 화면에서 너무 작게 보이지 않도록 최소 표시 폭을 적용합니다.
+2. `지사` 컬럼이 `보성지사`인 자료만 남깁니다.
+3. `이정`은 km 단위, `연장`은 m 단위로 해석합니다.
+4. 시설명에 `(순천)`, `(영암)`이 있으면 방향을 구분합니다.
+5. `서영암IC교` 같은 이름은 초성 `ㅅㅇㅇicㄱ`으로 변환해서 초성 검색이 가능하게 합니다.
+6. 선택 시설의 이정을 중심으로 `연장 / 2`만큼 앞뒤를 계산해 표시합니다.
+7. 전체 구간이 106.84km라 짧은 교량은 너무 작게 보이므로 최소 표시 폭을 적용합니다.
 """)
